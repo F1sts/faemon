@@ -1,0 +1,42 @@
+[project]
+name = "faemon"
+version = "1.0.0"
+description = "A high-performance background music service designed for zero-latency execution, parallel I/O processing."
+readme = "README.md"
+authors = [{ name = "F1sts" }]
+requires-python = ">=3.14"
+dependencies = [
+    "bump-my-version>=1.3.0",
+    "httpx>=0.28.1",
+    "pyinstaller>=6.20.0",
+    "starlette>=1.0.0",
+    "uvicorn>=0.46.0",
+    "yt-dlp>=2026.8.19",
+    "ytmusicapi>=1.12.2",
+]
+
+[dependency-groups]
+dev = ["poethepoet>=0.34.0"]
+
+[project.scripts]
+faemon = "faemon:main"
+
+[tool.bumpversion]
+current_version = "1.0.0"
+commit = false
+tag = false
+tag_name = "v{new_version}"
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[tool.poe.tasks]
+dev = "faemon"
+build = "pyinstaller faemon.spec"
+clean = "python -c \"import shutil; [shutil.rmtree(d, True) for d in ('build', 'dist')]\""
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"

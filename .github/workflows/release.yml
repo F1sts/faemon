@@ -1,0 +1,218 @@
+name: Build & Release
+
+on:
+    workflow_dispatch:
+        inputs:
+            bump:
+                description: "Version part to bump"
+                required: true
+                type: choice
+                options: [none, patch, minor, major]
+
+jobs:
+    # ---------------------------------------------------------
+    # 1. PREPARE: Bump version centrally and share the changes
+    # ---------------------------------------------------------
+    prepare:
+        runs-on: ubuntu-latest
+        outputs:
+            version: ${{ steps.get-version.outputs.version }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Set up uv
+              if: inputs.bump != 'none'
+              uses: astral-sh/setup-uv@v6
+
+            - name: Bump version locally
+              if: inputs.bump != 'none'
+              run: uvx bump-my-version bump ${{ inputs.bump }}
+
+            - name: Extract version string
+              id: get-version
+              shell: bash
+              run: echo "version=v$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml)" >> "$GITHUB_OUTPUT"
+
+            - name: Create Git Patch
+              if: inputs.bump != 'none'
+              run: git diff HEAD > bump.patch
+
+            - name: Upload Patch Artifact
+              if: inputs.bump != 'none'
+              uses: actions/upload-artifact@v4
+              with:
+                  name: bump-patch
+                  path: bump.patch
+                  retention-days: 1
+
+    # ---------------------------------------------------------
+    # 2. BUILD: Apply patch, build, and test on all platforms
+    # ---------------------------------------------------------
+    build:
+        needs: prepare
+        strategy:
+            matrix:
+                include:
+                    - runner: macos-latest
+                      os_name: darwin
+                      arch_name: aarch64
+                    - runner: macos-15-intel
+                      os_name: darwin
+                      arch_name: x64
+                    - runner: ubuntu-24.04-arm
+                      os_name: linux
+                      arch_name: aarch64
+                    - runner: ubuntu-latest
+                      os_name: linux
+                      arch_name: amd64
+                    - runner: windows-11-arm
+                      os_name: windows
+                      arch_name: arm64
+                    - runner: windows-latest
+                      os_name: windows
+                      arch_name: x64
+
+        runs-on: ${{ matrix.runner }}
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Download bump patch
+              if: inputs.bump != 'none'
+              uses: actions/download-artifact@v4
+              with:
+                  name: bump-patch
+
+            - name: Apply bump patch
+              if: inputs.bump != 'none'
+              # Ignore whitespace prevents line-ending issues on Windows runners
+              run: git apply --ignore-whitespace bump.patch
+
+            - name: Set up uv
+              uses: astral-sh/setup-uv@v6
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.14"
+
+            - name: Install dependencies
+              run: uv sync
+
+            - name: Build with PyInstaller
+              run: uv run poe build
+
+            - name: Rename executable
+              shell: bash
+              run: |
+                  cd dist
+                  for file in *; do
+                    if [ -d "$file" ]; then continue; fi
+
+                    if [[ "$file" == *".exe" ]]; then
+                      mv "$file" "faemon-${{ needs.prepare.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch_name }}.exe"
+                    else
+                      mv "$file" "faemon-${{ needs.prepare.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch_name }}"
+                    fi
+                  done
+
+                  if [ "${{ matrix.os_name }}-${{ matrix.arch_name }}" == "linux-amd64" ]; then
+                    cp "faemon-${{ needs.prepare.outputs.version }}-linux-amd64" "faemon-${{ needs.prepare.outputs.version }}-linux-x86_64"
+                  fi
+
+            - name: Test Executable
+              shell: bash
+              run: |
+                  if [ "${{ matrix.os_name }}" == "windows" ]; then
+                    EXEC="dist/faemon-${{ needs.prepare.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch_name }}.exe"
+                  else
+                    EXEC="dist/faemon-${{ needs.prepare.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch_name }}"
+                    chmod +x "$EXEC"
+                  fi
+
+                  echo "Testing $EXEC ..."
+
+                  $EXEC > handshake.json 2>server.log &
+                  SERVER_PID=$!
+
+                  for i in $(seq 1 30); do
+                    if [ -s handshake.json ]; then break; fi
+                    sleep 1
+                  done
+
+                  kill $SERVER_PID 2>/dev/null
+                  wait $SERVER_PID 2>/dev/null || true
+
+                  if [ ! -s handshake.json ]; then
+                    echo "❌ Test Failed: No handshake output within 30s."
+                    cat server.log
+                    exit 1
+                  fi
+
+                  if ! grep -q '"port"' handshake.json; then
+                    echo "❌ Test Failed: Handshake missing 'port' field."
+                    cat handshake.json
+                    exit 1
+                  fi
+
+                  echo "✅ Test Passed successfully!"
+
+            - name: Upload Build Artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: build-artifact-${{ matrix.os_name }}-${{ matrix.arch_name }}
+                  path: dist/*
+
+    # ---------------------------------------------------------
+    # 3. RELEASE: Commit, tag, push, and release
+    # ---------------------------------------------------------
+    release:
+        needs: [prepare, build]
+        permissions:
+            contents: write
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+                  ref: ${{ github.ref_name }}
+
+            - name: Download bump patch
+              if: inputs.bump != 'none'
+              uses: actions/download-artifact@v4
+              with:
+                  name: bump-patch
+
+            - name: Apply bump patch
+              if: inputs.bump != 'none'
+              run: git apply --ignore-whitespace bump.patch
+
+            - name: Commit, Tag, and Push
+              if: inputs.bump != 'none'
+              run: |
+                  git config user.name "github-actions[bot]"
+                  git config user.email "github-actions[bot]@users.noreply.github.com"
+                  git commit -am "build: bump version to ${{ needs.prepare.outputs.version }}"
+                  git tag ${{ needs.prepare.outputs.version }}
+                  git push origin HEAD:${{ github.ref_name }} --follow-tags
+
+            - name: Download all build artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  pattern: build-artifact-*
+                  merge-multiple: true
+                  path: release_assets
+
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ${{ needs.prepare.outputs.version }}
+                  name: ${{ needs.prepare.outputs.version }}
+                  generate_release_notes: true
+                  files: release_assets/*
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
