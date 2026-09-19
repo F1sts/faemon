@@ -1,6 +1,6 @@
 [project]
 name = "faemon"
-version = "1.0.0"
+version = "1.0.1"
 description = "A high-performance background music service designed for zero-latency execution, parallel I/O processing."
 readme = "README.md"
 authors = [{ name = "F1sts" }]
@@ -22,7 +22,7 @@ dev = ["poethepoet>=0.34.0"]
 faemon = "faemon:main"
 
 [tool.bumpversion]
-current_version = "1.0.0"
+current_version = "1.0.1"
 commit = false
 tag = false
 tag_name = "v{new_version}"
