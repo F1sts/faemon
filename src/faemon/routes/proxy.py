@@ -7,6 +7,7 @@ from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
 from ..helpers import err, get_state, ok, required
+from ..mp4patch import patcher_for
 
 _FORWARDED_UPSTREAM = (
     "content-type",
@@ -88,11 +89,22 @@ async def stream_proxy(request: Request):
     }
     resp_headers["access-control-allow-origin"] = "*"
 
+    patcher = patcher_for(
+        upstream.headers.get("content-type", ""),
+        upstream.headers.get("content-range", ""),
+    )
+
     async def body():
         try:
             async for chunk in upstream.aiter_bytes():
+                if patcher is not None:
+                    chunk = patcher.feed(chunk)
+                    if chunk is None:
+                        continue
                 yield chunk
         finally:
+            if patcher is not None and (tail := patcher.flush()):
+                yield tail
             await upstream.aclose()
 
     return StreamingResponse(

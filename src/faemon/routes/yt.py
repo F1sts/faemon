@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import urllib.parse
 from time import perf_counter
 
@@ -87,8 +88,14 @@ async def yt_stream(req: Request):
 
     video_url = f"https://www.youtube.com/watch?v={video_id}"
 
+    # Windows WebView2 (Chromium) seeks WebM fine; macOS/Linux WebKit
+    # (AVFoundation) cannot range-seek WebM and needs M4A instead.
+    audio_format = (
+        "bestaudio/best" if sys.platform == "win32" else "bestaudio[ext=m4a]/bestaudio/best"
+    )
+
     opts = {
-        "format": "bestaudio/best",
+        "format": audio_format,
         "extract_flat": True,
         "extractor_retries": 3,
         "retries": 5,
