@@ -82,7 +82,10 @@ async def yt_stream(req: Request):
 
     s = get_state(req)
 
-    cached = await s.cache.get(s.http, video_id)
+    fmt = req.query_params.get("format")
+    cache_key = f"{video_id}:{fmt}" if fmt else video_id
+
+    cached = await s.cache.get(s.http, cache_key)
     if cached is not None:
         return ok(cached, None)
 
@@ -90,7 +93,7 @@ async def yt_stream(req: Request):
 
     # Windows WebView2 (Chromium) seeks WebM fine; macOS/Linux WebKit
     # (AVFoundation) cannot range-seek WebM and needs M4A instead.
-    audio_format = (
+    audio_format = fmt or (
         "bestaudio/best" if sys.platform == "win32" else "bestaudio[ext=m4a]/bestaudio/best"
     )
 
@@ -132,7 +135,7 @@ async def yt_stream(req: Request):
             await asyncio.sleep(0.15)
             continue
 
-        s.cache.set(video_id, stream_url, expires_at, stream["http_headers"])
+        s.cache.set(cache_key, stream_url, expires_at, stream["http_headers"])
         return ok(stream, round(perf_counter() - start, 4))
 
     return err(f"Stream URL did not pass liveness check: {'; '.join(reasons)}", 502)

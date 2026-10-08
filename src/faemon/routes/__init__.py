@@ -3,7 +3,7 @@ from __future__ import annotations
 from starlette.routing import Route
 
 from ..helpers import ok
-from .proxy import sign_proxy, stream_proxy
+from .proxy import pcm_proxy, sign_proxy, stream_proxy
 from .suggestions import suggestions
 from .yt import yt_extract, yt_playlist, yt_search, yt_stream
 from .ytm import ytm_album, ytm_artist, ytm_playlist, ytm_search, ytm_watch_playlist
@@ -27,4 +27,5 @@ routes = [
     Route("/suggestions", suggestions),
     Route("/proxy/sign", sign_proxy),
     Route("/proxy/stream", stream_proxy),
+    Route("/proxy/pcm", pcm_proxy),
 ]

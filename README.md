@@ -141,6 +141,7 @@ Resolve the best audio-only stream URL for a YouTube video. Uses a TTL-based cac
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
 | `id` | Yes | — | YouTube video ID (11 characters) |
+| `format` | No | — | yt-dlp format override. When set, the stream cache is keyed as `id:format` so override results never poison the default cache entry. |
 
 Returns:
 
@@ -382,6 +383,21 @@ sequenceDiagram
     Y-->>F: stream response
     F-->>C: streaming audio response
 ```
+
+#### Step 3: `GET /proxy/pcm`
+
+Stream raw decoded PCM audio from an arbitrary offset. **Requires auth header** — unlike `/proxy/stream`, this endpoint sits behind the bearer middleware and additionally validates the per-video `sig` (obtain it the same way via `/proxy/sign`).
+
+faemon resolves the upstream URL, opens it with PyAV (FFmpeg), seeks to `t`, decodes audio only, and resamples to a canonical format. This is the audio source for the Rust-side PCM player.
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `id` | Yes | — | YouTube video ID |
+| `sig` | Yes | — | Signature obtained from `/proxy/sign` (bearer header also required) |
+| `t` | Yes | — | Start offset in seconds (float, `>= 0`) |
+| `format` | No | — | yt-dlp format override forwarded to `/yt/stream` (e.g. `bestaudio/best` to pin Opus/itag 251 regardless of platform default) |
+
+Response: `application/octet-stream` — little-endian signed 16-bit stereo at a fixed 48 kHz. Response headers `x-sample-rate`, `x-channels`, `x-sample-format` advertise the format. Chunks of ~100 ms of audio are streamed as they are decoded; the stream ends at end of media. Seeking = start a new request with a different `t`.
 
 ---
 
