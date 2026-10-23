@@ -9,7 +9,6 @@ from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
 from ..helpers import err, get_state, ok, required
-from ..mp4patch import patcher_for
 
 _FORWARDED_UPSTREAM = (
     "content-type",
@@ -100,13 +99,19 @@ async def stream_proxy(request: Request):
         headers["range"] = range_header
 
     state = get_state(request)
-    try:
-        upstream = await state.http.send(
-            state.http.build_request("GET", resolved["url"], headers=headers),
-            stream=True,
-        )
-    except httpx.HTTPError as exc:
-        return err(f"Upstream request failed: {exc}", 502)
+    # googlevideo closes pooled keep-alive connections after the cache's
+    # liveness HEAD; the first GET on the stale connection dies with an
+    # empty ReadError that one retry on a fresh connection heals.
+    for attempt in (1, 2):
+        try:
+            upstream = await state.http.send(
+                state.http.build_request("GET", resolved["url"], headers=headers),
+                stream=True,
+            )
+            break
+        except httpx.HTTPError as exc:
+            if attempt == 2:
+                return err(f"Upstream request failed: {exc}", 502)
 
     resp_headers = {
         name: upstream.headers[name]
@@ -115,22 +120,11 @@ async def stream_proxy(request: Request):
     }
     resp_headers["access-control-allow-origin"] = "*"
 
-    patcher = patcher_for(
-        upstream.headers.get("content-type", ""),
-        upstream.headers.get("content-range", ""),
-    )
-
     async def body():
         try:
             async for chunk in upstream.aiter_bytes():
-                if patcher is not None:
-                    chunk = patcher.feed(chunk)
-                    if chunk is None:
-                        continue
                 yield chunk
         finally:
-            if patcher is not None and (tail := patcher.flush()):
-                yield tail
             await upstream.aclose()
 
     return StreamingResponse(

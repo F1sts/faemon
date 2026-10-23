@@ -9,14 +9,22 @@ import httpx
 async def probe(
     client: httpx.AsyncClient, url: str, headers: dict | None = None
 ) -> str | None:
-    """Returns None if the URL is alive; otherwise a human-readable reason."""
-    try:
-        resp = await client.head(url, headers=headers or {}, timeout=5)
-    except httpx.HTTPError as exc:
-        return f"HEAD request failed: {exc}"
+    """Returns None if the URL is alive; otherwise a human-readable reason.
 
-    if not (200 <= resp.status_code < 400):
-        return f"HEAD returned HTTP {resp.status_code}"
+    Retries once on transport errors: googlevideo closes pooled keep-alive
+    connections after a HEAD, so the first request on a stale connection
+    dies with a ReadError that a fresh connection immediately heals."""
+    for attempt in (1, 2):
+        try:
+            resp = await client.head(url, headers=headers or {}, timeout=5)
+        except httpx.HTTPError as exc:
+            if attempt == 1:
+                continue
+            return f"HEAD request failed: {exc}"
+
+        if not (200 <= resp.status_code < 400):
+            return f"HEAD returned HTTP {resp.status_code}"
+        return None
     return None
 
 

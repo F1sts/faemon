@@ -395,7 +395,7 @@ faemon resolves the upstream URL, opens it with PyAV (FFmpeg), seeks to `t`, dec
 | `id` | Yes | — | YouTube video ID |
 | `sig` | Yes | — | Signature obtained from `/proxy/sign` (bearer header also required) |
 | `t` | Yes | — | Start offset in seconds (float, `>= 0`) |
-| `format` | No | — | yt-dlp format override forwarded to `/yt/stream` (e.g. `bestaudio/best` to pin Opus/itag 251 regardless of platform default) |
+| `format` | No | — | yt-dlp format override. When set, the stream cache is keyed as `id:format` so override results never poison the default cache entry. |
 
 Response: `application/octet-stream` — little-endian signed 16-bit stereo at a fixed 48 kHz. Response headers `x-sample-rate`, `x-channels`, `x-sample-format` advertise the format. Chunks of ~100 ms of audio are streamed as they are decoded; the stream ends at end of media. Seeking = start a new request with a different `t`.
 
@@ -438,9 +438,9 @@ src/
     ├── state.py             # Application state (config, cache, HTTP client)
     ├── routes/
     │   ├── __init__.py       # Route table assembly, health handler
-    │   ├── yt.py            # YouTube route handlers
+    │   ├── yt.py            # YouTube route handlers (Opus format selection)
     │   ├── ytm.py           # YouTube Music route handlers
-    │   ├── proxy.py         # Stream proxy with signed sessions
+    │   ├── proxy.py         # Stream proxy + PCM decode endpoint (PyAV)
     │   └── suggestions.py   # Search suggestion handler
     └── services/
         ├── yt.py            # yt-dlp wrapper and response parsers
