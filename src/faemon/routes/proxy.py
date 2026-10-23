@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import sys
 
 import av
 import httpx
@@ -20,6 +21,15 @@ _FORWARDED_UPSTREAM = (
 _PCM_SAMPLE_RATE = 48000
 _PCM_CHUNK_BYTES = _PCM_SAMPLE_RATE * 4 // 10
 _PCM_TIMEOUT = (10.0, 30.0)
+_PCM_MAX_RETRIES = 3
+
+
+class _Retry(Exception):
+    """Transient upstream failure; reopen and resume at `resume_at` seconds."""
+
+    def __init__(self, cause: BaseException, resume_at: float) -> None:
+        super().__init__(str(cause))
+        self.resume_at = resume_at
 
 
 async def sign_proxy(request: Request):
@@ -145,23 +155,39 @@ def _open_pcm(url: str, headers: dict, start: float):
     return container, audio
 
 
-def _pcm_frames(container, audio, start: float):
+def _pcm_frames(url: str, headers: dict, start: float, opened=None):
+    """Yield 100 ms s16le chunks from `start` seconds.
+
+    Raises _Retry on transient upstream read failures so the caller can
+    reopen and resume; `opened` (from `_open_pcm`) skips the initial open.
+    """
+    try:
+        container, audio = opened if opened is not None else _open_pcm(url, headers, start)
+    except av.FFmpegError as exc:
+        raise _Retry(exc, start) from None
+
     resampler = av.AudioResampler(
         format="s16", layout="stereo", rate=_PCM_SAMPLE_RATE
     )
     time_base = audio.time_base
     pending = bytearray()
+    last_ts = start
     try:
-        for frame in container.decode(audio):
-            if time_base and frame.pts is not None and frame.pts * time_base < start:
-                continue
-            for out in resampler.resample(frame):
-                pending += bytes(
-                    memoryview(out.planes[0])[: out.samples * 4]
-                )
-                while len(pending) >= _PCM_CHUNK_BYTES:
-                    yield bytes(pending[:_PCM_CHUNK_BYTES])
-                    del pending[:_PCM_CHUNK_BYTES]
+        try:
+            for frame in container.decode(audio):
+                if time_base and frame.pts is not None:
+                    last_ts = frame.pts * time_base
+                    if last_ts < start:
+                        continue
+                for out in resampler.resample(frame):
+                    pending += bytes(
+                        memoryview(out.planes[0])[: out.samples * 4]
+                    )
+                    while len(pending) >= _PCM_CHUNK_BYTES:
+                        yield bytes(pending[:_PCM_CHUNK_BYTES])
+                        del pending[:_PCM_CHUNK_BYTES]
+        except av.FFmpegError as exc:
+            raise _Retry(exc, last_ts) from None
         for out in resampler.resample(None):
             pending += bytes(memoryview(out.planes[0])[: out.samples * 4])
         if pending:
@@ -189,43 +215,69 @@ async def pcm_proxy(request: Request):
     if start < 0:
         return err("Parameter 't' must be >= 0", 400)
 
-    resolved = await _resolve_stream(
-        get_state(request), video_id, request.query_params.get("format")
-    )
+    state = get_state(request)
+    fmt = request.query_params.get("format")
+    resolved = await _resolve_stream(state, video_id, fmt)
     if not isinstance(resolved, dict):
         return resolved
 
     loop = asyncio.get_running_loop()
     try:
-        container, audio = await loop.run_in_executor(
+        opened = await loop.run_in_executor(
             None, _open_pcm, resolved["url"], resolved["http_headers"], start
         )
     except (av.FFmpegError, ValueError) as exc:
         return err(f"PCM open failed: {exc}", 502)
 
-    frames = _pcm_frames(container, audio, start)
+    start_pos = start
+    failures = 0
 
-    def next_chunk():
+    def next_chunk(frames):
         try:
             return next(frames)
         except StopIteration:
             return None
 
     async def body():
+        nonlocal resolved, start_pos, failures
+        frames = _pcm_frames(
+            resolved["url"], resolved["http_headers"], start_pos, opened
+        )
         inflight: asyncio.Future | None = None
         try:
             while True:
-                inflight = loop.run_in_executor(None, next_chunk)
-                chunk = await inflight
-                inflight = None
+                try:
+                    inflight = loop.run_in_executor(None, next_chunk, frames)
+                    chunk = await inflight
+                    inflight = None
+                except _Retry as retry:
+                    failures += 1
+                    if failures >= _PCM_MAX_RETRIES:
+                        raise
+                    start_pos = max(0.0, retry.resume_at)
+                    print(
+                        f"[faemon] pcm retry {failures}/{_PCM_MAX_RETRIES - 1}"
+                        f" from {start_pos:.1f}s: {retry}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    fresh = await _resolve_stream(state, video_id, fmt)
+                    if not isinstance(fresh, dict):
+                        raise
+                    resolved = fresh
+                    await loop.run_in_executor(None, frames.close)
+                    frames = _pcm_frames(
+                        resolved["url"], resolved["http_headers"], start_pos
+                    )
                 if chunk is None:
                     break
+                failures = 0
                 yield chunk
         finally:
             if inflight is not None:
                 try:
                     await inflight
-                except av.FFmpegError:
+                except (av.FFmpegError, _Retry):
                     pass
             await loop.run_in_executor(None, frames.close)
 

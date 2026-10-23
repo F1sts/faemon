@@ -25,7 +25,6 @@ async def probe(
         if not (200 <= resp.status_code < 400):
             return f"HEAD returned HTTP {resp.status_code}"
         return None
-    return None
 
 
 class StreamCache:
