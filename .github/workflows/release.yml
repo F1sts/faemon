@@ -198,7 +198,7 @@ jobs:
                   git config user.email "github-actions[bot]@users.noreply.github.com"
                   git commit -am "build: bump version to ${{ needs.prepare.outputs.version }}"
                   git tag ${{ needs.prepare.outputs.version }}
-                  git push origin HEAD:${{ github.ref_name }} --follow-tags
+                  git push origin HEAD:${{ github.ref_name }} ${{ needs.prepare.outputs.version }}
 
             - name: Download all build artifacts
               uses: actions/download-artifact@v4
