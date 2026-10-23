@@ -40,9 +40,8 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name="faemon",
     debug=False,
     bootloader_ignore_signals=False,
@@ -55,3 +54,8 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
+# Onedir, not onefile: the onefile bootloader re-extracts ~114 MB / 1257
+# files to a temp dir on every launch, adding 4-12s to every Exobeat
+# startup before the engine handshake.
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=True, name="faemon")

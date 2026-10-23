@@ -104,31 +104,13 @@ jobs:
             - name: Build with PyInstaller
               run: uv run poe build
 
-            - name: Rename executable
-              shell: bash
-              run: |
-                  cd dist
-                  for file in *; do
-                    if [ -d "$file" ]; then continue; fi
-
-                    if [[ "$file" == *".exe" ]]; then
-                      mv "$file" "faemon-${{ needs.prepare.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch_name }}.exe"
-                    else
-                      mv "$file" "faemon-${{ needs.prepare.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch_name }}"
-                    fi
-                  done
-
-                  if [ "${{ matrix.os_name }}-${{ matrix.arch_name }}" == "linux-amd64" ]; then
-                    cp "faemon-${{ needs.prepare.outputs.version }}-linux-amd64" "faemon-${{ needs.prepare.outputs.version }}-linux-x86_64"
-                  fi
-
             - name: Test Executable
               shell: bash
               run: |
                   if [ "${{ matrix.os_name }}" == "windows" ]; then
-                    EXEC="dist/faemon-${{ needs.prepare.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch_name }}.exe"
+                    EXEC="dist/faemon/faemon.exe"
                   else
-                    EXEC="dist/faemon-${{ needs.prepare.outputs.version }}-${{ matrix.os_name }}-${{ matrix.arch_name }}"
+                    EXEC="dist/faemon/faemon"
                     chmod +x "$EXEC"
                   fi
 
@@ -159,11 +141,46 @@ jobs:
 
                   echo "✅ Test Passed successfully!"
 
+            # Packages the PyInstaller onedir tree (dist/faemon) as a zip with
+            # the archive contents at the zip root — exactly the layout Exobeat
+            # extracts into its binaries dir. Symlinks (PyInstaller's
+            # unversioned FFmpeg dylib links) are stored as symlink entries so
+            # they don't balloon the archive into full copies.
+            - name: Package onedir as zip
+              shell: bash
+              run: |
+                  python - <<'EOF'
+                  import os
+                  import stat
+                  import zipfile
+
+                  version = "${{ needs.prepare.outputs.version }}"
+                  name = f"faemon-{version}-${{ matrix.os_name }}-${{ matrix.arch_name }}"
+                  src = os.path.join("dist", "faemon")
+
+                  with zipfile.ZipFile(os.path.join("dist", f"{name}.zip"), "w", zipfile.ZIP_DEFLATED) as zf:
+                      for root, _, files in os.walk(src):
+                          for f in files:
+                              full = os.path.join(root, f)
+                              rel = os.path.relpath(full, src).replace(os.sep, "/")
+                              st = os.lstat(full)
+                              if stat.S_ISLNK(st.st_mode):
+                                  info = zipfile.ZipInfo(rel)
+                                  info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                                  zf.writestr(info, os.readlink(full))
+                              else:
+                                  zf.write(full, rel)
+                  EOF
+
+                  if [ "${{ matrix.os_name }}-${{ matrix.arch_name }}" == "linux-amd64" ]; then
+                    cp "dist/faemon-${{ needs.prepare.outputs.version }}-linux-amd64.zip" "dist/faemon-${{ needs.prepare.outputs.version }}-linux-x86_64.zip"
+                  fi
+
             - name: Upload Build Artifact
               uses: actions/upload-artifact@v4
               with:
                   name: build-artifact-${{ matrix.os_name }}-${{ matrix.arch_name }}
-                  path: dist/*
+                  path: dist/*.zip
 
     # ---------------------------------------------------------
     # 3. RELEASE: Commit, tag, push, and release
