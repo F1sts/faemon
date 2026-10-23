@@ -3,9 +3,107 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import httpx
 from yt_dlp import YoutubeDL
 
 from ..helpers import view_count_str
+
+
+class FastAudioResolver:
+    """
+    Sub-200ms YouTube stream resolver using spatial/VR InnerTube clients.
+    Acts as a high-speed first-pass before falling back to yt-dlp.
+    """
+
+    INNERTUBE_URL = "https://www.youtube.com/youtubei/v1/player"
+
+    # Priority cascade: VisionOS (fastest, Opus 251) -> Quest VR (Opus 251) -> iOS (AAC 140)
+    CLIENT_CASCADE = [
+        {"clientName": "VISIONOS", "clientVersion": "0.1"},
+        {"clientName": "ANDROID_VR", "clientVersion": "1.61.47"},
+        {"clientName": "IOS", "clientVersion": "21.41.5"},
+    ]
+
+    def __init__(self):
+        # Persistent HTTP/2 client keeps connection/TLS warm across calls
+        self.http = httpx.Client(
+            http2=True,
+            timeout=2.5,  # Fail fast to trigger fallback if stalled
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+            },
+        )
+        self.visitor_data: str | None = None
+
+    def resolve(self, video_id: str) -> str | None:
+        """
+        Attempts to resolve a direct, unthrottled audio stream URL.
+        Returns the CDN URL string on success, or None on failure.
+        """
+        for client_info in self.CLIENT_CASCADE:
+            try:
+                context = {
+                    "client": {
+                        **client_info,
+                        "hl": "en",
+                        "gl": "US",
+                    }
+                }
+                if self.visitor_data:
+                    context["client"]["visitorData"] = self.visitor_data
+
+                payload = {
+                    "videoId": video_id,
+                    "context": context
+                }
+
+                resp = self.http.post(self.INNERTUBE_URL, json=payload)
+                if resp.status_code != 200:
+                    continue
+
+                # Update session visitorData for subsequent requests
+                header_visitor = resp.headers.get("X-YouTube-Visitor-Data")
+                if header_visitor:
+                    self.visitor_data = header_visitor
+
+                data = resp.json()
+                body_visitor = data.get("responseContext", {}).get("visitorData")
+                if body_visitor:
+                    self.visitor_data = body_visitor
+
+                formats = data.get("streamingData", {}).get("adaptiveFormats", [])
+
+                # 1. Best: ITag 251 (Opus ~160kbps)
+                for f in formats:
+                    if f.get("itag") == 251 and f.get("url"):
+                        return f["url"]
+
+                # 2. Alternative: ITag 140 (AAC ~128kbps)
+                for f in formats:
+                    if f.get("itag") == 140 and f.get("url"):
+                        return f["url"]
+
+                # 3. Fallback: Any direct audio stream
+                for f in formats:
+                    if "audio" in f.get("mimeType", "") and f.get("url"):
+                        return f["url"]
+
+            except Exception:
+                # On timeout, connection drop, or schema change, try next client
+                continue
+
+        # All fast clients failed -> signals caller to invoke yt-dlp
+        return None
+
+
+# Module-level singleton to maintain warm HTTP/2 connections in long-running processes
+_resolver_instance = FastAudioResolver()
+
+
+def get_fast_audio_url(video_id: str) -> str | None:
+    """Public helper for one-line imports."""
+    return _resolver_instance.resolve(video_id)
 
 
 def extract(query: str, options: dict[str, Any] | None = None) -> dict[str, Any]:

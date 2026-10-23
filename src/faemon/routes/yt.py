@@ -108,6 +108,24 @@ async def yt_stream(req: Request):
     }
 
     start = perf_counter()
+
+    # Fast path: InnerTube VR clients return unthrottled audio URLs directly.
+    # It always yields best-quality audio (Opus 251 / AAC 140), so only the
+    # default format is eligible; explicit yt-dlp overrides skip it.
+    if fmt in (None, "bestaudio/best"):
+        fast_url = await asyncio.to_thread(svc.get_fast_audio_url, video_id)
+        if fast_url and await probe(s.http, fast_url) is None:
+            expires_at = svc.extract_expiration(fast_url)
+            s.cache.set(cache_key, fast_url, expires_at, None)
+            return ok(
+                {
+                    "url": fast_url,
+                    "expires_at": expires_at,
+                    "http_headers": None,
+                },
+                round(perf_counter() - start, 4),
+            )
+
     reasons: list[str] = []
     for _ in range(3):
         try:
