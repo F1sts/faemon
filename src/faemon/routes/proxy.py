@@ -21,7 +21,7 @@ _FORWARDED_UPSTREAM = (
 _PCM_SAMPLE_RATE = 48000
 _PCM_CHUNK_BYTES = _PCM_SAMPLE_RATE * 4 // 10
 _PCM_TIMEOUT = (10.0, 30.0)
-_PCM_MAX_RETRIES = 3
+_PCM_MAX_RETRIES = 4
 
 
 class _Retry(Exception):
@@ -231,6 +231,26 @@ async def pcm_proxy(request: Request):
 
     start_pos = start
     failures = 0
+    delivered = 0
+
+    resp_headers = {
+        "x-sample-rate": str(_PCM_SAMPLE_RATE),
+        "x-channels": "2",
+        "x-sample-format": "s16le",
+    }
+    # Real stream length beats the client's video-metadata duration: tracks
+    # whose audio ends before the video must not look truncated.
+    if opened[0].duration:
+        resp_headers["x-duration"] = f"{opened[0].duration / 1_000_000:.3f}"
+
+    print(
+        f"[faemon] pcm start id={video_id} t={start:.1f}s"
+        f" dur={opened[0].duration / 1_000_000:.3f}s"
+        if opened[0].duration
+        else f"[faemon] pcm start id={video_id} t={start:.1f}s dur=?",
+        file=sys.stderr,
+        flush=True,
+    )
 
     def next_chunk(frames):
         try:
@@ -239,7 +259,7 @@ async def pcm_proxy(request: Request):
             return None
 
     async def body():
-        nonlocal resolved, start_pos, failures
+        nonlocal resolved, start_pos, failures, delivered
         frames = _pcm_frames(
             resolved["url"], resolved["http_headers"], start_pos, opened
         )
@@ -253,11 +273,18 @@ async def pcm_proxy(request: Request):
                 except _Retry as retry:
                     failures += 1
                     if failures >= _PCM_MAX_RETRIES:
+                        print(
+                            f"[faemon] pcm failed id={video_id}"
+                            f" after {_PCM_MAX_RETRIES - 1} retries"
+                            f" at {start_pos:.1f}s: {retry}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         raise
                     start_pos = max(0.0, retry.resume_at)
                     print(
                         f"[faemon] pcm retry {failures}/{_PCM_MAX_RETRIES - 1}"
-                        f" from {start_pos:.1f}s: {retry}",
+                        f" id={video_id} from {start_pos:.1f}s: {retry}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -269,10 +296,29 @@ async def pcm_proxy(request: Request):
                     frames = _pcm_frames(
                         resolved["url"], resolved["http_headers"], start_pos
                     )
+                    continue
                 if chunk is None:
                     break
                 failures = 0
-                yield chunk
+                delivered += len(chunk)
+                try:
+                    yield chunk
+                except GeneratorExit:
+                    print(
+                        f"[faemon] pcm client closed id={video_id}"
+                        f" at ~{start + delivered / (_PCM_SAMPLE_RATE * 4):.1f}s"
+                        f" ({delivered} bytes)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    raise
+            print(
+                f"[faemon] pcm complete id={video_id}"
+                f" delivered={delivered} bytes"
+                f" (~{start + delivered / (_PCM_SAMPLE_RATE * 4):.1f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
         finally:
             if inflight is not None:
                 try:
@@ -284,9 +330,5 @@ async def pcm_proxy(request: Request):
     return StreamingResponse(
         body(),
         media_type="application/octet-stream",
-        headers={
-            "x-sample-rate": str(_PCM_SAMPLE_RATE),
-            "x-channels": "2",
-            "x-sample-format": "s16le",
-        },
+        headers=resp_headers,
     )
