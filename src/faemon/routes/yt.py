@@ -126,16 +126,23 @@ async def yt_stream(req: Request):
                 round(perf_counter() - start, 4),
             )
 
-    reasons: list[str] = []
-    for _ in range(3):
+    last_error: str | None = None
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(0.25)
+
         try:
             raw = await asyncio.to_thread(svc.extract, video_url, opts)
         except Exception as e:
-            return err(str(e))
+            # YouTube intermittently 403s the player API or returns an empty
+            # body; yt-dlp's own retries do not always outlast the window.
+            last_error = str(e)
+            continue
 
         stream_url = svc.parse_stream_url(raw)
         if not stream_url:
-            return err("yt-dlp returned an empty stream URL", 502)
+            last_error = "yt-dlp returned an empty stream URL"
+            continue
 
         expires_at = svc.extract_expiration(stream_url)
         http_headers = raw.get("http_headers")
@@ -146,14 +153,13 @@ async def yt_stream(req: Request):
         }
 
         if reason := await probe(s.http, stream_url, stream["http_headers"]):
-            reasons.append(reason)
-            await asyncio.sleep(0.15)
+            last_error = f"Stream URL did not pass liveness check: {reason}"
             continue
 
         s.cache.set(cache_key, stream_url, expires_at, stream["http_headers"])
         return ok(stream, round(perf_counter() - start, 4))
 
-    return err(f"Stream URL did not pass liveness check: {'; '.join(reasons)}", 502)
+    return err(last_error or "Stream resolution failed", 502)
 
 
 async def yt_extract(req: Request):

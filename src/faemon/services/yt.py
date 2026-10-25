@@ -41,57 +41,67 @@ class FastAudioResolver:
         Attempts to resolve a direct, unthrottled audio stream URL.
         Returns the CDN URL string on success, or None on failure.
         """
-        for client_info in self.CLIENT_CASCADE:
-            try:
-                context = {
-                    "client": {
-                        **client_info,
-                        "hl": "en",
-                        "gl": "US",
+        # A fresh session has no visitorData, and YouTube rejects its first
+        # request ("Sign in to confirm you're not a bot") while still handing
+        # back a visitorData. Retry the cascade once with it rather than
+        # falling through to yt-dlp on every cold start.
+        for _ in range(2):
+            visitor_before = self.visitor_data
+
+            for client_info in self.CLIENT_CASCADE:
+                try:
+                    context = {
+                        "client": {
+                            **client_info,
+                            "hl": "en",
+                            "gl": "US",
+                        }
                     }
-                }
-                if self.visitor_data:
-                    context["client"]["visitorData"] = self.visitor_data
+                    if self.visitor_data:
+                        context["client"]["visitorData"] = self.visitor_data
 
-                payload = {
-                    "videoId": video_id,
-                    "context": context
-                }
+                    payload = {
+                        "videoId": video_id,
+                        "context": context
+                    }
 
-                resp = self.http.post(self.INNERTUBE_URL, json=payload)
-                if resp.status_code != 200:
+                    resp = self.http.post(self.INNERTUBE_URL, json=payload)
+                    if resp.status_code != 200:
+                        continue
+
+                    # Update session visitorData for subsequent requests
+                    header_visitor = resp.headers.get("X-YouTube-Visitor-Data")
+                    if header_visitor:
+                        self.visitor_data = header_visitor
+
+                    data = resp.json()
+                    body_visitor = data.get("responseContext", {}).get("visitorData")
+                    if body_visitor:
+                        self.visitor_data = body_visitor
+
+                    formats = data.get("streamingData", {}).get("adaptiveFormats", [])
+
+                    # 1. Best: ITag 251 (Opus ~160kbps)
+                    for f in formats:
+                        if f.get("itag") == 251 and f.get("url"):
+                            return f["url"]
+
+                    # 2. Alternative: ITag 140 (AAC ~128kbps)
+                    for f in formats:
+                        if f.get("itag") == 140 and f.get("url"):
+                            return f["url"]
+
+                    # 3. Fallback: Any direct audio stream
+                    for f in formats:
+                        if "audio" in f.get("mimeType", "") and f.get("url"):
+                            return f["url"]
+
+                except Exception:
+                    # On timeout, connection drop, or schema change, try next client
                     continue
 
-                # Update session visitorData for subsequent requests
-                header_visitor = resp.headers.get("X-YouTube-Visitor-Data")
-                if header_visitor:
-                    self.visitor_data = header_visitor
-
-                data = resp.json()
-                body_visitor = data.get("responseContext", {}).get("visitorData")
-                if body_visitor:
-                    self.visitor_data = body_visitor
-
-                formats = data.get("streamingData", {}).get("adaptiveFormats", [])
-
-                # 1. Best: ITag 251 (Opus ~160kbps)
-                for f in formats:
-                    if f.get("itag") == 251 and f.get("url"):
-                        return f["url"]
-
-                # 2. Alternative: ITag 140 (AAC ~128kbps)
-                for f in formats:
-                    if f.get("itag") == 140 and f.get("url"):
-                        return f["url"]
-
-                # 3. Fallback: Any direct audio stream
-                for f in formats:
-                    if "audio" in f.get("mimeType", "") and f.get("url"):
-                        return f["url"]
-
-            except Exception:
-                # On timeout, connection drop, or schema change, try next client
-                continue
+            if self.visitor_data is None or self.visitor_data == visitor_before:
+                break
 
         # All fast clients failed -> signals caller to invoke yt-dlp
         return None
