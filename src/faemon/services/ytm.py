@@ -8,7 +8,7 @@ from ..helpers import view_count_str
 from ..state import Config
 
 
-def _make_ytm(config: Config) -> YTMusic:
+def make_ytm(config: Config) -> YTMusic:
     return YTMusic(language=config.language, location=config.location)
 
 
@@ -22,21 +22,21 @@ def search(
     filter: str | None = None,
     limit: int = 20,
 ) -> list[dict]:
-    with _make_ytm(config) as ytm:
+    with make_ytm(config) as ytm:
         raw = ytm.search(
             query=query,
             filter=filter,
             limit=limit,
             ignore_spelling=False,
         )
-    return [r for e in raw if (r := _parse_entry(e)) is not None]
+    return [r for e in raw if (r := parse_entry(e)) is not None]
 
 
 # ── Playlist ────────────────────────────────────────────────────────────────
 
 
 def playlist(config: Config, playlist_id: str) -> dict | None:
-    with _make_ytm(config) as ytm:
+    with make_ytm(config) as ytm:
         raw = ytm.get_playlist(
             playlistId=playlist_id, limit=None, related=False, suggestions_limit=0
         )
@@ -47,7 +47,7 @@ def playlist(config: Config, playlist_id: str) -> dict | None:
 
 
 def album(config: Config, browse_id: str) -> dict | None:
-    with _make_ytm(config) as ytm:
+    with make_ytm(config) as ytm:
         raw = ytm.get_album(browseId=browse_id)
     return _parse_album(raw, browse_id)
 
@@ -56,7 +56,7 @@ def album(config: Config, browse_id: str) -> dict | None:
 
 
 def artist(config: Config, channel_id: str) -> dict | None:
-    with _make_ytm(config) as ytm:
+    with make_ytm(config) as ytm:
         raw = ytm.get_artist(channelId=channel_id)
     return _parse_artist(raw)
 
@@ -82,7 +82,7 @@ def watch_playlist(
     else:
         kwargs["playlistId"] = id
 
-    with _make_ytm(config) as ytm:
+    with make_ytm(config) as ytm:
         raw = ytm.get_watch_playlist(**kwargs)
 
     tracks = raw.get("tracks") or []
@@ -93,7 +93,7 @@ def watch_playlist(
 # ── Parsers ─────────────────────────────────────────────────────────────────
 
 
-def _parse_entry(entry: dict) -> dict | None:
+def parse_entry(entry: dict) -> dict | None:
     result_type = entry.get("resultType") or (entry.get("videoId") and "song")
     if result_type is None:
         return None
@@ -151,7 +151,7 @@ def _parse_playlist(raw: dict) -> dict | None:
             authors = [{"name": name, "id": author.get("id")}]
 
     tracks = raw.get("tracks") or []
-    entries = [_parse_entry(t) for t in tracks]
+    entries = [parse_entry(t) for t in tracks]
     entries = [e for e in entries if e is not None]
 
     return {
@@ -181,7 +181,7 @@ def _parse_album(raw: dict, browse_id: str) -> dict | None:
     artists = _parse_artists_array(raw)
 
     tracks = raw.get("tracks") or []
-    entries = [_parse_entry(t) for t in tracks]
+    entries = [parse_entry(t) for t in tracks]
     entries = [e for e in entries if e is not None]
 
     other = raw.get("other_versions")

@@ -19,6 +19,7 @@
 - **Stream Resolution** — Extracts best-quality audio stream URLs from YouTube with automatic retry and TTL-based caching
 - **YouTube Search** — Search videos, playlists, and channels with type filtering
 - **YouTube Music** — Full access to search, playlists, albums, artists, and radio/shuffle watch playlists
+- **Spotify Import** — Converts Spotify playlists to YouTube Music by matching each track on title, artist, and duration
 - **Search Suggestions** — Real-time YouTube autocomplete suggestions
 - **Stream Proxy** — Built-in authenticated proxy that streams audio through the local server, bypassing CORS and header restrictions
 - **CORS** — Global `allow-origin: *` middleware applied to all endpoints
@@ -302,6 +303,32 @@ Returns an array of track entries.
 
 ---
 
+### `GET /spotify/playlist`
+
+Import a Spotify playlist by resolving every track to YouTube Music. Accepts a full Spotify playlist URL or a bare 22-character playlist ID.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `id` | Yes | Spotify playlist URL or playlist ID |
+| `stream` | No | When `1`, respond with newline-delimited JSON progress events instead of a single JSON response |
+
+Returns the standard playlist shape, plus `matched_count`. `track_count` is the number of tracks found on Spotify, while `entries` contains only the tracks that matched on YouTube Music. Matching scores title identity, artist overlap, and duration, so large playlists take noticeably longer than other endpoints.
+
+With `stream=1`, each line is one event. Progress events precede the final result:
+
+```json
+{"stage": "extracting", "completed": 0, "total": 0}
+{"stage": "extracting", "completed": 0, "total": 46}
+{"stage": "extracting", "completed": 46, "total": 46}
+{"stage": "matching", "completed": 0, "total": 146}
+{"stage": "matching", "completed": 146, "total": 146}
+{"result": {"...": "standard playlist object"}, "elapsed": 18.63}
+```
+
+An error is reported as `{"error": "message", "status": 502}` and terminates the stream.
+
+---
+
 ### `GET /suggestions`
 
 Fetch YouTube autocomplete suggestions for a query.
@@ -440,11 +467,13 @@ src/
     │   ├── __init__.py       # Route table assembly, health handler
     │   ├── yt.py            # YouTube route handlers (Opus format selection)
     │   ├── ytm.py           # YouTube Music route handlers
+    │   ├── spotify.py       # Spotify playlist import handler
     │   ├── proxy.py         # Stream proxy + PCM decode endpoint (PyAV)
     │   └── suggestions.py   # Search suggestion handler
     └── services/
         ├── yt.py            # yt-dlp wrapper and response parsers
         ├── ytm.py           # ytmusicapi wrapper and response parsers
+        ├── spotify.py       # Spotify extraction + YouTube Music matching
         └── suggestions.py   # Google suggestion fetcher
 ```
 
