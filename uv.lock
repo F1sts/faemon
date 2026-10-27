@@ -160,11 +160,12 @@ wheels = [
 
 [[package]]
 name = "faemon"
-version = "1.2.0"
+version = "1.2.3"
 source = { editable = "." }
 dependencies = [
     { name = "av" },
     { name = "bump-my-version" },
+    { name = "certifi" },
     { name = "httpx", extra = ["http2"] },
     { name = "pyinstaller" },
     { name = "starlette" },
@@ -182,6 +183,7 @@ dev = [
 requires-dist = [
     { name = "av", specifier = ">=19.0.1" },
     { name = "bump-my-version", specifier = ">=1.3.0" },
+    { name = "certifi", specifier = ">=2026.4.22" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.28.1" },
     { name = "pyinstaller", specifier = ">=6.20.0" },
     { name = "starlette", specifier = ">=1.0.0" },

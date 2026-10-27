@@ -5,6 +5,7 @@ import secrets
 import sys
 
 import av
+import certifi
 import httpx
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
@@ -144,6 +145,12 @@ async def stream_proxy(request: Request):
 
 def _open_pcm(url: str, headers: dict, start: float):
     options = {"headers": "\r\n".join(f"{k}: {v}" for k, v in headers.items())}
+    if sys.platform == "linux":
+        # The PyAV Linux wheels link GnuTLS, whose CA store is baked to the
+        # RHEL-only /etc/pki/tls/cert.pem at build time. Point it at the
+        # certifi bundle instead; macOS (SecureTransport) and Windows
+        # (schannel) use the OS store and need no override.
+        options["ca_file"] = certifi.where()
     container = av.open(url, options=options, timeout=_PCM_TIMEOUT)
     try:
         audio = next(s for s in container.streams if s.type == "audio")
