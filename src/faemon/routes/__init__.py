@@ -3,6 +3,7 @@ from __future__ import annotations
 from starlette.routing import Route
 
 from ..helpers import ok
+from .lyrics import lyrics
 from .proxy import pcm_proxy, sign_proxy, stream_proxy
 from .spotify import spotify_playlist
 from .suggestions import suggestions
@@ -26,6 +27,7 @@ routes = [
     Route("/ytm/artist", ytm_artist),
     Route("/ytm/watch-playlist", ytm_watch_playlist),
     Route("/spotify/playlist", spotify_playlist),
+    Route("/lyrics", lyrics),
     Route("/suggestions", suggestions),
     Route("/proxy/sign", sign_proxy),
     Route("/proxy/stream", stream_proxy),
