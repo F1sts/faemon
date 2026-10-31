@@ -21,16 +21,13 @@ _FORWARDED_UPSTREAM = (
 
 _PCM_SAMPLE_RATE = 48000
 _PCM_CHUNK_BYTES = _PCM_SAMPLE_RATE * 4 // 10
+_PCM_BYTES_PER_SEC = _PCM_SAMPLE_RATE * 4
 _PCM_TIMEOUT = (10.0, 30.0)
 _PCM_MAX_RETRIES = 4
 
 
 class _Retry(Exception):
-    """Transient upstream failure; reopen and resume at `resume_at` seconds."""
-
-    def __init__(self, cause: BaseException, resume_at: float) -> None:
-        super().__init__(str(cause))
-        self.resume_at = resume_at
+    """Transient upstream failure; caller resumes from bytes delivered."""
 
 
 async def sign_proxy(request: Request):
@@ -162,39 +159,55 @@ def _open_pcm(url: str, headers: dict, start: float):
     return container, audio
 
 
-def _pcm_frames(url: str, headers: dict, start: float, opened=None):
+def _pcm_frames(url: str, headers: dict, start: float, opened=None, splice_at: int | None = None):
     """Yield 100 ms s16le chunks from `start` seconds.
 
     Raises _Retry on transient upstream read failures so the caller can
     reopen and resume; `opened` (from `_open_pcm`) skips the initial open.
+    `splice_at` is an absolute byte offset into the track: on the retry path
+    output resumes exactly at that sample boundary, so the client hears a
+    continuous stream with no duplicated or dropped segment.
     """
     try:
         container, audio = opened if opened is not None else _open_pcm(url, headers, start)
     except av.FFmpegError as exc:
-        raise _Retry(exc, start) from None
+        raise _Retry(exc) from None
 
     resampler = av.AudioResampler(
         format="s16", layout="stereo", rate=_PCM_SAMPLE_RATE
     )
     time_base = audio.time_base
+    frame_rate = audio.rate or _PCM_SAMPLE_RATE
     pending = bytearray()
-    last_ts = start
     try:
         try:
             for frame in container.decode(audio):
                 if time_base and frame.pts is not None:
-                    last_ts = frame.pts * time_base
-                    if last_ts < start:
+                    pos = frame.pts * time_base
+                    if pos < start:
                         continue
+                    if splice_at is not None:
+                        frame_end = round(
+                            (pos + frame.samples / frame_rate)
+                            * _PCM_BYTES_PER_SEC
+                        )
+                        if frame_end <= splice_at:
+                            continue
                 for out in resampler.resample(frame):
                     pending += bytes(
                         memoryview(out.planes[0])[: out.samples * 4]
                     )
-                    while len(pending) >= _PCM_CHUNK_BYTES:
-                        yield bytes(pending[:_PCM_CHUNK_BYTES])
-                        del pending[:_PCM_CHUNK_BYTES]
+                if splice_at is not None:
+                    if time_base and frame.pts is not None:
+                        drop = splice_at - round(pos * _PCM_BYTES_PER_SEC)
+                        if drop > 0:
+                            del pending[:drop]
+                    splice_at = None
+                while len(pending) >= _PCM_CHUNK_BYTES:
+                    yield bytes(pending[:_PCM_CHUNK_BYTES])
+                    del pending[:_PCM_CHUNK_BYTES]
         except av.FFmpegError as exc:
-            raise _Retry(exc, last_ts) from None
+            raise _Retry(exc) from None
         for out in resampler.resample(None):
             pending += bytes(memoryview(out.planes[0])[: out.samples * 4])
         if pending:
@@ -236,7 +249,7 @@ async def pcm_proxy(request: Request):
     except (av.FFmpegError, ValueError) as exc:
         return err(f"PCM open failed: {exc}", 502)
 
-    start_pos = start
+    start_bytes = round(start * _PCM_BYTES_PER_SEC)
     failures = 0
     delivered = 0
 
@@ -266,9 +279,9 @@ async def pcm_proxy(request: Request):
             return None
 
     async def body():
-        nonlocal resolved, start_pos, failures, delivered
+        nonlocal resolved, failures, delivered
         frames = _pcm_frames(
-            resolved["url"], resolved["http_headers"], start_pos, opened
+            resolved["url"], resolved["http_headers"], start, opened
         )
         inflight: asyncio.Future | None = None
         try:
@@ -279,19 +292,20 @@ async def pcm_proxy(request: Request):
                     inflight = None
                 except _Retry as retry:
                     failures += 1
+                    splice = start_bytes + delivered
                     if failures >= _PCM_MAX_RETRIES:
                         print(
                             f"[faemon] pcm failed id={video_id}"
                             f" after {_PCM_MAX_RETRIES - 1} retries"
-                            f" at {start_pos:.1f}s: {retry}",
+                            f" at {splice / _PCM_BYTES_PER_SEC:.1f}s: {retry}",
                             file=sys.stderr,
                             flush=True,
                         )
                         raise
-                    start_pos = max(0.0, retry.resume_at)
                     print(
                         f"[faemon] pcm retry {failures}/{_PCM_MAX_RETRIES - 1}"
-                        f" id={video_id} from {start_pos:.1f}s: {retry}",
+                        f" id={video_id} at {splice / _PCM_BYTES_PER_SEC:.2f}s"
+                        f" (byte-exact): {retry}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -301,7 +315,10 @@ async def pcm_proxy(request: Request):
                     resolved = fresh
                     await loop.run_in_executor(None, frames.close)
                     frames = _pcm_frames(
-                        resolved["url"], resolved["http_headers"], start_pos
+                        resolved["url"],
+                        resolved["http_headers"],
+                        max(0.0, splice / _PCM_BYTES_PER_SEC - 0.5),
+                        splice_at=splice,
                     )
                     continue
                 if chunk is None:
