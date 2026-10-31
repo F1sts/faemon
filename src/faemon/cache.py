@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 
 import httpx
@@ -65,3 +66,23 @@ class StreamCache:
             while len(self._store) >= self._max_size:
                 self._store.pop(next(iter(self._store)))
         self._store[video_id] = (url, expires_at, headers)
+
+
+class MatchCache:
+    """Thread-safe FIFO cache of resolved Spotify-to-YouTube Music matches."""
+
+    def __init__(self, max_size: int = 2048) -> None:
+        self._store: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self._max_size = max_size
+
+    def get(self, key: str) -> dict | None:
+        with self._lock:
+            return self._store.get(key)
+
+    def set(self, key: str, value: dict) -> None:
+        with self._lock:
+            if key not in self._store:
+                while len(self._store) >= self._max_size:
+                    self._store.pop(next(iter(self._store)))
+            self._store[key] = value

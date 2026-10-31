@@ -312,7 +312,7 @@ Import a Spotify playlist by resolving every track to YouTube Music. Accepts a f
 | `id` | Yes | Spotify playlist URL or playlist ID |
 | `stream` | No | When `1`, respond with newline-delimited JSON progress events instead of a single JSON response |
 
-Returns the standard playlist shape, plus `matched_count`. `track_count` is the number of tracks found on Spotify, while `entries` contains only the tracks that matched on YouTube Music. Matching scores title identity, artist overlap, and duration, so large playlists take noticeably longer than other endpoints.
+Returns the standard playlist shape, plus `matched_count` and `unmatched` — an array of `{title, artist}` for tracks with no acceptable YouTube Music match. `track_count` is the number of tracks found on Spotify, while `entries` contains only the tracks that matched on YouTube Music. Matching scores title identity, artist overlap, and duration, so large playlists take noticeably longer than other endpoints.
 
 With `stream=1`, each line is one event. Progress events precede the final result:
 
@@ -326,6 +326,24 @@ With `stream=1`, each line is one event. Progress events precede the final resul
 ```
 
 An error is reported as `{"error": "message", "status": 502}` and terminates the stream.
+
+---
+
+### `POST /spotify/match`
+
+Re-runs matching for tracks a previous import could not resolve (the `unmatched` entries above). Successful matches are written to the in-process match cache, so re-importing the same playlist picks them up instantly.
+
+**Body:**
+
+```json
+{
+  "tracks": [
+    {"id": "spotify-or-local-id", "title": "Song", "artist": "Artist", "duration": 213}
+  ]
+}
+```
+
+Returns `{"entries": ["...matched track entry objects..."], "matched_count": 1, "unmatched": ["...still unresolved..."]}`.
 
 ---
 

@@ -1,22 +1,28 @@
 from __future__ import annotations
 
+import html
 import json
+import random
 import re
+import sys
+import threading
 import time
 import unicodedata
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+from urllib.parse import unquote_plus
 
 import httpx
 from ytmusicapi import YTMusic
 
-from ..state import Config
+from ..cache import MatchCache
+from ..state import Config, State
 from .ytm import make_ytm, parse_entry
 
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 _NEXT_DATA_RE = re.compile(
     r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.DOTALL
@@ -38,10 +44,16 @@ _VARIANT_SUFFIX_RE = re.compile(
 )
 
 _TRACK_PREFIX = "spotify:track:"
+_LOCAL_PREFIX = "spotify:local:"
 _ARTIST_SEPARATOR_RE = re.compile(
     r"\s*(?:&|\+|\band\b|\bwith\b)\s*", re.IGNORECASE
 )
+_OG_TITLE_RE = re.compile(r'<meta property="og:title" content="(.*?)"')
+_OG_DESCRIPTION_RE = re.compile(r'<meta property="og:description" content="(.*?)"')
 _WORKERS = 8
+_SPOTIFY_REQ_PER_SEC = 4.0
+_YTM_REQ_PER_SEC = 4.0
+_GET_ATTEMPTS = 6
 
 _NOISE_WORDS = {
     "album",
@@ -108,20 +120,63 @@ class SpotifyError(Exception):
         self.status = status
 
 
+class _Cancelled(BaseException):
+    """Raised inside workers once the client has gone; escapes generic handlers."""
+
+
+class _RateLimiter:
+    """Paces Spotify requests process-wide; pause_all coordinates 429 backoff."""
+
+    def __init__(self, rate_per_sec: float) -> None:
+        self._interval = 1.0 / rate_per_sec
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            sleep_for = max(0.0, self._next_allowed - now)
+            self._next_allowed = (
+                max(now, self._next_allowed)
+                + self._interval
+                + random.uniform(0.02, 0.08)
+            )
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    def pause_all(self, seconds: float) -> None:
+        with self._lock:
+            # Failures landing inside an active cooldown don't extend it;
+            # otherwise a burst of failing workers ratchets the debt into
+            # minutes of total silence.
+            now = time.monotonic()
+            if now >= self._next_allowed:
+                self._next_allowed = now + seconds
+
+
+_SPOTIFY_LIMITER = _RateLimiter(_SPOTIFY_REQ_PER_SEC)
+_YTM_LIMITER = _RateLimiter(_YTM_REQ_PER_SEC)
+
+
 def playlist(
-    config: Config,
+    state: State,
     url_or_id: str,
     on_progress: ProgressCallback | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
     playlist_id = _extract_playlist_id(url_or_id)
     if on_progress:
         on_progress("extracting", 0, 0)
 
-    source = _fetch_playlist(playlist_id, on_progress)
+    source = _fetch_playlist(playlist_id, on_progress, state.spotify_matches, cancel)
+    if cancel is not None and cancel.is_set():
+        raise _Cancelled()
     if on_progress:
         on_progress("matching", 0, len(source["tracks"]))
 
-    entries = _match_tracks(config, source["tracks"], on_progress)
+    entries, unmatched = _match_tracks(
+        state.config, source["tracks"], on_progress, state.spotify_matches, cancel
+    )
 
     return {
         "id": playlist_id,
@@ -138,6 +193,32 @@ def playlist(
         "other_versions": None,
         "related_recommendations": None,
         "matched_count": len(entries),
+        "unmatched": unmatched,
+    }
+
+
+def match(state: State, tracks: list[Any]) -> dict[str, Any]:
+    """Re-runs matching for tracks a previous import could not resolve."""
+    clean = [
+        {
+            "id": str(track.get("id") or f"retry:{index}"),
+            "title": str(track.get("title") or ""),
+            "artist": str(track.get("artist") or "Unknown Artist"),
+            "duration": int(track.get("duration") or 0),
+        }
+        for index, track in enumerate(tracks)
+        if isinstance(track, dict) and track.get("title")
+    ]
+    if not clean:
+        raise ValueError("No tracks with a title to match")
+
+    entries, unmatched = _match_tracks(
+        state.config, clean, None, state.spotify_matches
+    )
+    return {
+        "entries": entries,
+        "matched_count": len(entries),
+        "unmatched": unmatched,
     }
 
 
@@ -152,27 +233,46 @@ def _get(
     timeout: float = 15.0,
 ) -> httpx.Response:
     response: httpx.Response | None = None
-    for attempt in (1, 2):
+    for attempt in range(_GET_ATTEMPTS):
+        _SPOTIFY_LIMITER.wait()
         try:
             response = client.get(url, headers=headers, timeout=timeout)
         except httpx.HTTPError as exc:
-            if attempt == 2:
+            if attempt == _GET_ATTEMPTS - 1:
                 raise SpotifyError(f"Could not reach Spotify: {exc}") from exc
+            time.sleep(_backoff(attempt))
             continue
 
-        if response.status_code < 500 and response.status_code != 429:
-            return response
-        if attempt == 1:
-            time.sleep(0.5)
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            wait_sec = (
+                float(retry_after)
+                if retry_after is not None and retry_after.isdigit()
+                else min(30.0, 4.0 * (attempt + 1))
+            )
+            _SPOTIFY_LIMITER.pause_all(wait_sec)
+            continue
+
+        if response.status_code >= 500 and attempt < _GET_ATTEMPTS - 1:
+            time.sleep(_backoff(attempt))
+            continue
+
+        return response
 
     if response is None:
         raise SpotifyError("Could not reach Spotify")
     return response
 
 
+def _backoff(attempt: int) -> float:
+    return 1.5**attempt + random.uniform(0.2, 0.6)
+
+
 def _fetch_playlist(
     playlist_id: str,
     on_progress: ProgressCallback | None = None,
+    cache: MatchCache | None = None,
+    cancel: threading.Event | None = None,
 ) -> dict[str, Any]:
     with httpx.Client(
         headers={"User-Agent": _USER_AGENT},
@@ -209,19 +309,65 @@ def _fetch_playlist(
             metadata[track["id"]] = track
             embed_ids.append(track["id"])
 
-        track_ids = (
-            embed_ids
-            if len(items) < 100
-            else _fetch_full_track_ids(client, playlist_id, state)
-        )
+        # The embed payload caps and omits episodes/locals unpredictably (seen
+        # returning as few as 99 items for a 900+ track playlist), so the
+        # spclient listing is always the source of truth when a token exists.
+        track_ids = embed_ids
+        local_tracks: dict[str, dict] = {}
+        session = (state.get("settings") or {}).get("session") or {}
+        token = session.get("accessToken")
+        if isinstance(token, str) and token:
+            try:
+                track_ids, local_tracks = _fetch_full_track_ids(
+                    client, playlist_id, token
+                )
+            except SpotifyError as exc:
+                print(
+                    f"[faemon] spotify: full tracklist unavailable ({exc}); "
+                    f"falling back to the first {len(embed_ids)} embed tracks",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        elif len(items) >= 100:
+            print(
+                f"[faemon] spotify: no embed session token; only the first "
+                f"{len(embed_ids)} of a larger playlist will be imported",
+                file=sys.stderr,
+                flush=True,
+            )
 
-        missing = [track_id for track_id in track_ids if track_id not in metadata]
+        unresolved = [
+            track_id
+            for track_id in track_ids
+            if track_id not in metadata and track_id not in local_tracks
+        ]
+        cached_ids: set[str] = set()
+        if cache is not None:
+            cached_ids = {
+                track_id
+                for track_id in unresolved
+                if cache.get(track_id) is not None
+            }
+            for track_id in cached_ids:
+                # Title stays empty: matching resolves these from the cache,
+                # and an eviction mid-run degrades to unmatched, not garbage.
+                metadata[track_id] = {
+                    "id": track_id,
+                    "title": "",
+                    "artist": "",
+                    "duration": 0,
+                }
+        missing = [
+            track_id for track_id in unresolved if track_id not in cached_ids
+        ]
         if missing:
+            # Progress reads against the full tracklist; tracks whose metadata
+            # came free with the embed page (and cache hits) count as done.
             if on_progress:
-                on_progress("extracting", 0, len(missing))
+                on_progress("extracting", len(track_ids) - len(missing), len(track_ids))
             with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
                 futures = [
-                    pool.submit(_fetch_track, client, track_id)
+                    pool.submit(_fetch_track, client, track_id, cancel)
                     for track_id in missing
                 ]
                 for completed, future in enumerate(as_completed(futures), start=1):
@@ -229,20 +375,29 @@ def _fetch_playlist(
                     if track is not None:
                         metadata[track["id"]] = track
                     if on_progress:
-                        on_progress("extracting", completed, len(missing))
+                        on_progress(
+                            "extracting",
+                            len(track_ids) - len(missing) + completed,
+                            len(track_ids),
+                        )
+                    if cancel is not None and cancel.is_set():
+                        break
 
-    tracks = [metadata[track_id] for track_id in track_ids if track_id in metadata]
+    tracks = [
+        local_tracks.get(track_id) or metadata.get(track_id)
+        for track_id in track_ids
+    ]
     return {
         "title": title,
         "owner": owner,
         "thumbnails": thumbnails,
-        "tracks": tracks,
+        "tracks": [track for track in tracks if track is not None],
         "total": len(track_ids),
     }
 
 
-def _page_state(html: str) -> dict:
-    match = _NEXT_DATA_RE.search(html)
+def _page_props(page: str) -> dict:
+    match = _NEXT_DATA_RE.search(page)
     if match is None:
         raise SpotifyError("Could not parse Spotify page")
 
@@ -251,19 +406,18 @@ def _page_state(html: str) -> dict:
     except json.JSONDecodeError as exc:
         raise SpotifyError("Could not parse Spotify page") from exc
 
-    state = data.get("props", {}).get("pageProps", {}).get("state")
+    props = data.get("props", {}).get("pageProps")
+    return props if isinstance(props, dict) else {}
+
+
+def _page_state(page: str) -> dict:
+    state = _page_props(page).get("state")
     return state if isinstance(state, dict) else {}
 
 
 def _fetch_full_track_ids(
-    client: httpx.Client, playlist_id: str, state: dict
-) -> list[str]:
-    settings = state.get("settings") or {}
-    session = settings.get("session") or {}
-    token = session.get("accessToken")
-    if not isinstance(token, str) or not token:
-        raise SpotifyError("Could not fetch the complete Spotify playlist")
-
+    client: httpx.Client, playlist_id: str, token: str
+) -> tuple[list[str], dict[str, dict]]:
     resp = _get(
         client,
         f"https://spclient.wg.spotify.com/playlist/v2/playlist/{playlist_id}",
@@ -286,16 +440,26 @@ def _fetch_full_track_ids(
     if contents.get("truncated"):
         raise SpotifyError("Spotify playlist is too large to import")
 
-    items = contents.get("items") or []
-    track_ids = [
-        track_id
-        for item in items
-        if isinstance(item, dict)
-        and (track_id := _track_id(item.get("uri"))) is not None
-    ]
+    track_ids: list[str] = []
+    local_tracks: dict[str, dict] = {}
+    for item in contents.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        uri = item.get("uri")
+        if not isinstance(uri, str):
+            continue
+        if uri.startswith(_TRACK_PREFIX):
+            track_id = uri[len(_TRACK_PREFIX) :]
+            if track_id:
+                track_ids.append(track_id)
+        elif uri.startswith(_LOCAL_PREFIX):
+            track = _parse_local_track(uri)
+            if track is not None:
+                local_tracks[track["id"]] = track
+                track_ids.append(track["id"])
     if not track_ids:
         raise SpotifyError("Spotify playlist has no tracks", 404)
-    return track_ids
+    return track_ids, local_tracks
 
 
 def _parse_embed_track(item: Any) -> dict | None:
@@ -320,22 +484,37 @@ def _parse_embed_track(item: Any) -> dict | None:
     }
 
 
-def _fetch_track(client: httpx.Client, track_id: str) -> dict | None:
+def _fetch_track(
+    client: httpx.Client,
+    track_id: str,
+    cancel: threading.Event | None = None,
+) -> dict | None:
+    if cancel is not None and cancel.is_set():
+        return None
     try:
         resp = _get(
             client, f"https://open.spotify.com/embed/track/{track_id}", timeout=10.0
         )
         if resp.status_code != 200:
             return None
-        state = _page_state(resp.text)
+        props = _page_props(resp.text)
     except SpotifyError:
         return None
 
-    data = state.get("data")
+    state = props.get("state")
+    data = state.get("data") if isinstance(state, dict) else None
     entity = data.get("entity") if isinstance(data, dict) else None
     if not isinstance(entity, dict):
-        return None
+        entity = props.get("entity")
+    if isinstance(entity, dict):
+        track = _track_from_entity(entity, track_id)
+        if track is not None:
+            return track
 
+    return _track_from_meta_tags(resp.text, track_id)
+
+
+def _track_from_entity(entity: dict, track_id: str) -> dict | None:
     title = entity.get("name") or entity.get("title")
     if not isinstance(title, str) or not title:
         return None
@@ -350,15 +529,57 @@ def _fetch_track(client: httpx.Client, track_id: str) -> dict | None:
         if isinstance(artists, list)
         else []
     )
+    fallback = entity.get("subtitle")
+    artist = (
+        ", ".join(name for name in names if name)
+        or (fallback if isinstance(fallback, str) and fallback else "")
+        or "Unknown Artist"
+    )
     duration = entity.get("duration")
 
     return {
         "id": track_id,
         "title": title,
-        "artist": ", ".join(name for name in names if name) or "Unknown Artist",
+        "artist": artist,
         "duration": int(duration // 1000)
         if isinstance(duration, (int, float)) and duration > 0
         else 0,
+    }
+
+
+def _track_from_meta_tags(page: str, track_id: str) -> dict | None:
+    """Recovers title/artist from OpenGraph tags when the embed payload is empty."""
+    title_match = _OG_TITLE_RE.search(page)
+    if title_match is None:
+        return None
+    title = html.unescape(title_match.group(1)).strip()
+    if not title:
+        return None
+
+    artist = "Unknown Artist"
+    desc_match = _OG_DESCRIPTION_RE.search(page)
+    if desc_match is not None:
+        first = html.unescape(desc_match.group(1)).split("·")[0].strip()
+        if first:
+            artist = first
+
+    return {"id": track_id, "title": title, "artist": artist, "duration": 0}
+
+
+def _parse_local_track(uri: str) -> dict | None:
+    """Builds a searchable track from a spotify:local: file URI."""
+    parts = uri.split(":")
+    artist = unquote_plus(parts[2]).strip() if len(parts) > 2 else ""
+    title = unquote_plus(parts[4]).strip() if len(parts) > 4 else ""
+    duration_ms = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 0
+    if not title:
+        return None
+
+    return {
+        "id": f"local:{artist}:{title}:{duration_ms}",
+        "title": title,
+        "artist": artist or "Unknown Artist",
+        "duration": duration_ms // 1000,
     }
 
 
@@ -401,22 +622,108 @@ def _match_tracks(
     config: Config,
     tracks: list[dict],
     on_progress: ProgressCallback | None = None,
+    cache: MatchCache | None = None,
+    cancel: threading.Event | None = None,
 ) -> list[dict]:
     if not tracks:
         return []
 
+    positions: dict[str, list[int]] = {}
+    unique: list[dict] = []
+    for index, track in enumerate(tracks):
+        positions.setdefault(track["id"], []).append(index)
+        if len(positions[track["id"]]) == 1:
+            unique.append(track)
+
     ordered: list[dict | None] = [None] * len(tracks)
+    completed = 0
+
+    def place(track_id: str, entry: dict | None, emit: bool = True) -> None:
+        nonlocal completed
+        if entry is not None:
+            for index in positions[track_id]:
+                ordered[index] = entry
+        completed += len(positions[track_id])
+        if on_progress and emit:
+            on_progress("matching", completed, len(tracks))
+
+    pending: list[dict] = []
+    for track in unique:
+        cached = cache.get(track["id"]) if cache is not None else None
+        if cached is not None:
+            place(track["id"], cached)
+        else:
+            pending.append(track)
+
+    retry: list[dict] = []
+
+    def handle(track: dict, entry: dict | None, retriable: bool) -> None:
+        if entry is not None:
+            if cache is not None:
+                cache.set(track["id"], entry)
+            place(track["id"], entry)
+        elif retriable:
+            retry.append(track)
+        else:
+            place(track["id"], None)
+
+    if pending and not (cancel is not None and cancel.is_set()):
+        _resolve_batch(config, pending, cancel, handle)
+
+    if retry and not (cancel is not None and cancel.is_set()):
+        # Time-separated from the failure: the throttle window that killed
+        # the first pass has usually closed by the time the bulk finished.
+        done = 0
+        if on_progress:
+            on_progress("retrying", 0, len(retry))
+
+        def handle_retry(track: dict, entry: dict | None, retriable: bool) -> None:
+            nonlocal done
+            if entry is not None and cache is not None:
+                cache.set(track["id"], entry)
+            place(track["id"], entry, emit=False)
+            done += 1
+            if on_progress:
+                on_progress("retrying", done, len(retry))
+
+        _resolve_batch(config, retry, cancel, handle_retry)
+        if on_progress:
+            on_progress("matching", completed, len(tracks))
+
+    unmatched: list[dict[str, str | int]] = []
+    reported: set[str] = set()
+    for track, entry in zip(tracks, ordered):
+        if entry is not None or track["id"] in reported or not track["title"]:
+            continue
+        reported.add(track["id"])
+        unmatched.append(
+            {
+                "id": track["id"],
+                "title": track["title"],
+                "artist": track["artist"],
+                "duration": track["duration"],
+            }
+        )
+
+    return [entry for entry in ordered if entry is not None], unmatched
+
+
+def _resolve_batch(
+    config: Config,
+    tracks: list[dict],
+    cancel: threading.Event | None = None,
+    on_result: Callable[[dict, dict | None, bool], None] | None = None,
+) -> None:
     with make_ytm(config) as ytm, ThreadPoolExecutor(max_workers=_WORKERS) as pool:
         futures = {
-            pool.submit(_match_track, ytm, track): index
-            for index, track in enumerate(tracks)
+            pool.submit(_match_track, ytm, track, cancel): track
+            for track in tracks
         }
-        for completed, future in enumerate(as_completed(futures), start=1):
-            ordered[futures[future]] = future.result()
-            if on_progress:
-                on_progress("matching", completed, len(tracks))
-
-    return [entry for entry in ordered if entry is not None]
+        for future in as_completed(futures):
+            track = futures[future]
+            entry, retriable = future.result()
+            if on_result is not None:
+                on_result(track, entry, retriable)
 
 
 def _search(
@@ -425,19 +732,35 @@ def _search(
     *,
     filter: str,
     limit: int,
+    cancel: threading.Event | None = None,
 ) -> list[dict]:
-    for attempt in (1, 2):
+    for attempt in range(3):
+        if cancel is not None and cancel.is_set():
+            raise _Cancelled()
+        _YTM_LIMITER.wait()
         try:
             return ytm.search(query=query, filter=filter, limit=limit)
         except Exception:
-            # ytmusicapi surfaces throttled responses as assorted errors.
+            # ytmusicapi surfaces throttled responses as assorted errors, and
+            # a failure usually means the IP is throttled as a whole — cool
+            # the shared limiter down so all workers back off together
+            # instead of re-arming into the throttle.
             if attempt == 2:
                 raise
-            time.sleep(0.5)
+            _YTM_LIMITER.pause_all(2.0 * (attempt + 1))
+            time.sleep(1.0 * (attempt + 1))
     return []
 
 
-def _match_track(ytm: YTMusic, track: dict) -> dict | None:
+def _match_track(
+    ytm: YTMusic,
+    track: dict,
+    cancel: threading.Event | None = None,
+) -> tuple[dict | None, bool]:
+    """Returns (entry, retriable); retriable marks a transient lookup failure."""
+    if not track["title"]:
+        return None, False
+
     title = _clean_title(track["title"]) or track["title"]
     queries = [f"{track['artist']} - {title}"]
     if title != track["title"]:
@@ -450,7 +773,7 @@ def _match_track(ytm: YTMusic, track: dict) -> dict | None:
     best_score = -1.0
     try:
         for query in queries:
-            candidates = _search(ytm, query, filter="songs", limit=5)
+            candidates = _search(ytm, query, filter="songs", limit=5, cancel=cancel)
             candidate = _best_match(candidates, track)
             if candidate is None:
                 continue
@@ -465,13 +788,17 @@ def _match_track(ytm: YTMusic, track: dict) -> dict | None:
             ):
                 break
         if best is None:
-            candidates = _search(ytm, queries[0], filter="videos", limit=3)
+            candidates = _search(
+                ytm, queries[0], filter="videos", limit=3, cancel=cancel
+            )
             best = _best_match(candidates, track)
+    except _Cancelled:
+        return None, False
     except Exception:
-        # A single failed lookup must not abort the rest of the playlist.
-        return None
+        # A transient failure must not abort the batch; the retry pass re-runs it.
+        return None, True
 
-    return parse_entry(best) if best is not None else None
+    return (parse_entry(best) if best is not None else None), False
 
 
 def _primary_artist(spotify_artist: str) -> str:

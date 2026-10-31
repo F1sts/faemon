@@ -5,7 +5,7 @@ from starlette.routing import Route
 from ..helpers import ok
 from .lyrics import lyrics
 from .proxy import pcm_proxy, sign_proxy, stream_proxy
-from .spotify import spotify_playlist
+from .spotify import spotify_match, spotify_playlist
 from .suggestions import suggestions
 from .yt import yt_extract, yt_playlist, yt_search, yt_stream
 from .ytm import ytm_album, ytm_artist, ytm_playlist, ytm_search, ytm_watch_playlist
@@ -27,6 +27,7 @@ routes = [
     Route("/ytm/artist", ytm_artist),
     Route("/ytm/watch-playlist", ytm_watch_playlist),
     Route("/spotify/playlist", spotify_playlist),
+    Route("/spotify/match", spotify_match, methods=["POST"]),
     Route("/lyrics", lyrics),
     Route("/suggestions", suggestions),
     Route("/proxy/sign", sign_proxy),
