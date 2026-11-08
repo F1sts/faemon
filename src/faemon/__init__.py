@@ -10,6 +10,7 @@ import threading
 import uvicorn
 
 from .app import create_app
+from .services.yt import set_deno_path
 from .state import Config, State
 
 
@@ -33,7 +34,14 @@ def main() -> None:
         default=None,
         help="File descriptor whose EOF signals the parent process has died",
     )
+    parser.add_argument(
+        "--deno-path",
+        default=None,
+        help="Deno binary used by yt-dlp as its external JS runtime",
+    )
     args = parser.parse_args()
+
+    set_deno_path(args.deno_path)
 
     if args.parent_death_fd is not None:
         fd = args.parent_death_fd

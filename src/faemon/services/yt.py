@@ -116,8 +116,19 @@ def get_fast_audio_url(video_id: str) -> str | None:
     return _resolver_instance.resolve(video_id)
 
 
+_deno_path: str | None = None
+
+
+def set_deno_path(path: str | None) -> None:
+    """Pin yt-dlp's default JS runtime to this Deno binary."""
+    global _deno_path
+    _deno_path = path
+
+
 def extract(query: str, options: dict[str, Any] | None = None) -> dict[str, Any]:
     opts = {**(options or {}), "quiet": True, "no_warnings": True}
+    if _deno_path:
+        opts["js_runtimes"] = {"deno": {"path": _deno_path}}
     with YoutubeDL(opts) as ydl:
         return ydl.extract_info(query, download=False)
 
